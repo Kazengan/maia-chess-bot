@@ -19,8 +19,8 @@
   /*************************
    * Configuration
    *************************/
-  const MODEL_URL = 'https://cdn.jsdelivr.net/gh/your-username/maia-chess-models@main/maia2_models/rapid_model_quantized.onnx';
-  const MOVE_VOCAB_URL = 'https://cdn.jsdelivr.net/gh/your-username/maia-chess-models@main/move_vocab.json';
+  const MODEL_URL = 'https://raw.githubusercontent.com/Kazengan/maia-chess-bot/main/maia2_models/rapid_model_quantized.onnx';
+  const MOVE_VOCAB_URL = 'https://raw.githubusercontent.com/Kazengan/maia-chess-bot/main/maia2_models/move_vocab.json';
   const MODEL_CACHE_KEY = 'maia-chess-model-v1';
   // Bucketing aligned with maia2.utils.create_elo_dict
   function eloToBucket(elo){
