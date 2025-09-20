@@ -1,0 +1,4 @@
+Model size: 266.75 MB
+Model parameters: 23,297,486
+Device: cpu
+State dict keys: 114

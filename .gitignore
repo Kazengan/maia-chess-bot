@@ -1,3 +1,7 @@
 .venv/
-maia2_models/
+venv/
+
+# maia2_models/
 maia2/
+
+maia2_models/rapid_model.pt
