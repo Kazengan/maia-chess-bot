@@ -1,162 +1,245 @@
 #!/usr/bin/env python3
-"""
-Convert Maia2 PyTorch model to ONNX format with quantization for browser deployment.
+"""Export Maia2 PyTorch checkpoints to ONNX with optional quantisation.
+
+This script keeps the conversion as faithful as possible by:
+  * reusing the original preprocessing utilities (board_to_tensor,
+    map_to_category) so the exported graph sees the exact tensor format
+    used during training/inference;
+  * running an ONNX Runtime side-by-side check against the PyTorch
+    model on a representative FEN set to make sure numerical drift is
+    negligible;
+  * supporting an optional quantisation step that can be skipped if it
+    hurts accuracy.
+
+The default export produces `maia2_models/rapid_model.onnx`.  Invoke
+`--quantize` to additionally create `rapid_model_quantized.onnx` after
+verifying accuracy.
 """
 
-import torch
-import torch.nn as nn
-from maia2 import model, inference
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from pathlib import Path
+from typing import Iterable, Tuple
+
+import chess
+import numpy as np
 import onnx
 import onnxruntime as ort
-from onnxruntime.quantization import quantize_dynamic, QuantType
-import numpy as np
-import os
-from typing import Tuple, Dict, Any
+import torch
+from onnxruntime.quantization import QuantFormat, QuantType, quantize_dynamic
 
-def create_dummy_input() -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Create dummy input for model export."""
-    # Create dummy FEN input (simplified board representation)
-    # This should match the expected input format for Maia2
-    batch_size = 1
-    # Board representation (18 channels: 12 for pieces, 6 for additional info)
-    board_input = torch.randn(batch_size, 18, 8, 8)
-    
-    # ELO inputs - need to be 1D tensor of bucket indices (0-10) for embedding layer
-    # Based on model analysis, ELO is mapped to buckets 0-10
-    elo_self = torch.tensor([5], dtype=torch.long)  # Middle bucket (1100-1300)
-    elo_oppo = torch.tensor([5], dtype=torch.long)  # Middle bucket (1100-1300)
-    return board_input, elo_self, elo_oppo
+from maia2 import model as maia_model_lib
+from maia2.utils import (
+    board_to_tensor,
+    create_elo_dict,
+    map_to_category,
+)
 
-def export_to_onnx(model: nn.Module, output_path: str) -> None:
-    """Export PyTorch model to ONNX format."""
-    print(f"Exporting model to ONNX: {output_path}")
-    
-    # Create dummy input
-    board_input, elo_self, elo_oppo = create_dummy_input()
-    
-    # Set model to evaluation mode
-    model.eval()
-    
-    # Export to ONNX
-    torch.onnx.export(
-        model,
-        (board_input, elo_self, elo_oppo),
-        output_path,
-        export_params=True,
-        opset_version=14,
-        do_constant_folding=True,
-        input_names=['board_input', 'elo_self', 'elo_oppo'],
-        output_names=['move_probs', 'win_prob'],
-        dynamic_axes={
-            'board_input': {0: 'batch_size'},
-            'elo_self': {0: 'batch_size'},
-            'elo_oppo': {0: 'batch_size'},
-            'move_probs': {0: 'batch_size'},
-            'win_prob': {0: 'batch_size'}
-        }
-    )
-    
-    print(f"Model exported to: {output_path}")
-    
-    # Verify the exported model
-    verify_onnx_model(output_path)
+# Representative positions covering different game phases so the export
+# is traced with meaningful data. Feel free to extend.
+REPRESENTATIVE_FENS = [
+    "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+    "r1bqkbnr/pppp1ppp/2n5/4p3/1bP5/2N2N2/PP1PPPPP/R1BQKB1R w KQkq - 0 4",
+    "r2q1rk1/pp1n1pbp/2pp1np1/4p3/2P1P3/1P1PBN2/PBQN1PPP/R3K2R w KQ - 4 10",
+    "8/8/8/2k5/8/8/5PPP/4K2R w K - 1 40",
+]
 
-def verify_onnx_model(onnx_path: str) -> None:
-    """Verify the exported ONNX model."""
-    print("Verifying ONNX model...")
-    
-    # Load the ONNX model
-    onnx_model = onnx.load(onnx_path)
+
+def _prepare_inputs(fens: Iterable[str], elo: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Convert FENs to tensors consistent with training preprocessing."""
+    elo_dict = create_elo_dict()
+    elo_bucket = map_to_category(elo, elo_dict)
+
+    boards = []
+    for fen in fens:
+        board = chess.Board(fen)
+        tensor = board_to_tensor(board)  # (18, 8, 8)
+        boards.append(tensor)
+    boards_tensor = torch.stack(boards, dim=0).to(torch.float32)
+
+    batch = boards_tensor.shape[0]
+    elo_tensor = torch.full((batch,), elo_bucket, dtype=torch.long)
+    return boards_tensor, elo_tensor.clone(), elo_tensor.clone()
+
+
+def export_onnx_model(
+    model: torch.nn.Module,
+    output_path: Path,
+    sample_fens: Iterable[str],
+    sample_elo: int,
+    opset: int = 17,
+) -> None:
+    output_path = output_path.resolve()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    boards, elos_self, elos_oppo = _prepare_inputs(sample_fens, sample_elo)
+
+    model_cpu = model.cpu().eval()
+    with torch.no_grad():
+        torch.onnx.export(
+            model_cpu,
+            (boards, elos_self, elos_oppo),
+            str(output_path),
+            input_names=["board_input", "elo_self", "elo_oppo"],
+            output_names=["move_probs", "side_info_logits", "win_prob"],
+            dynamic_axes={
+                "board_input": {0: "batch"},
+                "elo_self": {0: "batch"},
+                "elo_oppo": {0: "batch"},
+                "move_probs": {0: "batch"},
+                "side_info_logits": {0: "batch"},
+                "win_logits": {0: "batch"},
+            },
+            opset_version=opset,
+            do_constant_folding=True,
+        )
+
+    print(f"Exported ONNX model to {output_path}")
+
+    # Basic structural check
+    onnx_model = onnx.load(str(output_path))
     onnx.checker.check_model(onnx_model)
-    
-    print("ONNX model verification completed successfully!")
+    print("ONNX model structure validated.")
 
-def quantize_onnx_model(input_path: str, output_path: str) -> None:
-    """Apply dynamic quantization to ONNX model."""
-    print(f"Applying dynamic quantization to: {input_path}")
-    print(f"Output will be saved to: {output_path}")
-    
-    # Apply dynamic quantization
-    quantize_dynamic(
-        model_input=input_path,
-        model_output=output_path,
-        op_types_to_quantize=['MatMul', 'Gemm'],  # Only quantize linear layers
-        weight_type=QuantType.QInt8  # Use 8-bit integer quantization
-    )
-    
-    print(f"Quantized model saved to: {output_path}")
-    
-    # Compare model sizes
-    original_size = os.path.getsize(input_path) / 1024 / 1024  # MB
-    quantized_size = os.path.getsize(output_path) / 1024 / 1024  # MB
-    
-    print(f"Original model size: {original_size:.2f} MB")
-    print(f"Quantized model size: {quantized_size:.2f} MB")
-    print(f"Size reduction: {((original_size - quantized_size) / original_size * 100):.1f}%")
 
-def test_onnx_inference(onnx_path: str) -> None:
-    """Test ONNX model inference."""
-    print("Testing ONNX model inference...")
-    
-    # Create ONNX Runtime session
-    ort_session = ort.InferenceSession(onnx_path)
-    
-    # Create dummy input
-    board_input, elo_self, elo_oppo = create_dummy_input()
-    
-    # Convert to numpy arrays
-    board_np = board_input.numpy()
-    elo_self_np = elo_self.numpy()  # Already Long type
-    elo_oppo_np = elo_oppo.numpy()  # Already Long type
-    
-    # Run inference
+def _run_torch(model: torch.nn.Module, boards, elos_self, elos_oppo):
+    model.eval()
+    with torch.no_grad():
+        return model(boards, elos_self, elos_oppo)
+
+
+def _run_onnx(session: ort.InferenceSession, boards, elos_self, elos_oppo):
     inputs = {
-        'board_input': board_np,
-        'elo_self': elo_self_np,
-        'elo_oppo': elo_oppo_np
+        "board_input": boards.cpu().numpy(),
+        "elo_self": elos_self.cpu().numpy(),
+        "elo_oppo": elos_oppo.cpu().numpy(),
     }
-    
-    outputs = ort_session.run(None, inputs)
-    
-    print(f"Output shape: {[output.shape for output in outputs]}")
-    print(f"Move probabilities range: [{outputs[0].min():.4f}, {outputs[0].max():.4f}]")
-    print(f"Win probability: {outputs[1][0][0]:.4f}")
-    print("ONNX inference test completed successfully!")
+    return session.run(None, inputs)
 
-def main():
-    """Main conversion pipeline."""
-    print("=" * 60)
-    print("Maia2 Model Conversion Pipeline")
-    print("=" * 60)
-    
-    # Paths
-    original_model_path = "maia2_models/rapid_model.pt"
-    onnx_path = "maia2_models/rapid_model.onnx"
-    quantized_onnx_path = "maia2_models/rapid_model_quantized.onnx"
-    
-    # Step 1: Load original Maia2 model
-    print("\n1. Loading original Maia2 model...")
-    maia_model = model.from_pretrained(type="rapid", device="cpu")
-    print(f"Model loaded successfully with {sum(p.numel() for p in maia_model.parameters()):,} parameters")
-    
-    # Step 2: Export to ONNX
-    print("\n2. Exporting to ONNX format...")
-    export_to_onnx(maia_model, onnx_path)
-    
-    # Step 3: Apply quantization
-    print("\n3. Applying dynamic quantization...")
-    quantize_onnx_model(onnx_path, quantized_onnx_path)
-    
-    # Step 4: Test quantized model
-    print("\n4. Testing quantized model inference...")
-    test_onnx_inference(quantized_onnx_path)
-    
-    print("\n" + "=" * 60)
-    print("Model conversion completed successfully!")
-    print(f"Original model: {original_model_path}")
-    print(f"ONNX model: {onnx_path}")
-    print(f"Quantized ONNX model: {quantized_onnx_path}")
-    print("=" * 60)
+
+def verify_against_pytorch(
+    model: torch.nn.Module,
+    onnx_path: Path,
+    fens: Iterable[str],
+    elo: int,
+    atol: float = 1e-4,
+) -> None:
+    boards, elos_self, elos_oppo = _prepare_inputs(fens, elo)
+
+    torch_logits = _run_torch(model, boards, elos_self, elos_oppo)
+    ort_sess = ort.InferenceSession(str(onnx_path))
+    ort_logits = _run_onnx(ort_sess, boards, elos_self, elos_oppo)
+
+    names = ["move_probs", "side_info_logits", "win_prob"]
+    for name, torch_out, ort_out in zip(names, torch_logits, ort_logits):
+        diff = np.max(np.abs(torch_out.cpu().numpy() - ort_out))
+        print(f"Δ({name}) = {diff:.6f}")
+        if diff > atol:
+            raise RuntimeError(
+                f"ONNX output '{name}' deviates from PyTorch by {diff:.6f}, "
+                f"which is above tolerance {atol}."
+            )
+    print("Numerical parity check passed.")
+
+
+def maybe_quantize(onnx_path: Path, output_path: Path) -> None:
+    print(f"Quantising {onnx_path} → {output_path} (dynamic INT8 on linear ops)…")
+    quantize_dynamic(
+        model_input=str(onnx_path),
+        model_output=str(output_path),
+        op_types_to_quantize=["MatMul", "Gemm"],
+        weight_type=QuantType.QInt8,
+        optimize_model=True,
+        per_channel=False,
+        reduce_range=False,
+        quant_format=QuantFormat.QDQ,
+    )
+    orig_size = onnx_path.stat().st_size / (1024 * 1024)
+    quant_size = output_path.stat().st_size / (1024 * 1024)
+    print(f"  size: {orig_size:.2f} MiB → {quant_size:.2f} MiB")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--output",
+        default="maia2_models/rapid_model.onnx",
+        type=Path,
+        help="Path to save the exported ONNX model",
+    )
+    parser.add_argument(
+        "--quantize",
+        action="store_true",
+        help="Also produce a dynamically quantised model",
+    )
+    parser.add_argument(
+        "--quantized-output",
+        default="maia2_models/rapid_model_quantized.onnx",
+        type=Path,
+        help="Target path for the quantised model (if --quantize)",
+    )
+    parser.add_argument(
+        "--opset",
+        type=int,
+        default=17,
+        help="ONNX opset version to use",
+    )
+    parser.add_argument(
+        "--verification-elo",
+        type=int,
+        default=1500,
+        help="ELO bucket to use for parity checks",
+    )
+    parser.add_argument(
+        "--fens",
+        type=str,
+        default=None,
+        help="Optional JSON/line-delimited file with extra FENs for verification",
+    )
+    return parser.parse_args()
+
+
+def load_additional_fens(path: str | None) -> Iterable[str]:
+    if not path:
+        return []
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(p)
+    try:
+        with p.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        if not isinstance(data, list):
+            raise ValueError("JSON file must contain a list of FEN strings")
+        return data
+    except json.JSONDecodeError:
+        with p.open("r", encoding="utf-8") as fh:
+            return [line.strip() for line in fh if line.strip()]
+
+
+def main() -> None:
+    args = parse_args()
+
+    device = torch.device("cpu")
+    print("Loading Maia2 rapid model…")
+    maia_model = maia_model_lib.from_pretrained(type="rapid", device=device)
+
+    sample_fens = list(REPRESENTATIVE_FENS)
+    sample_fens.extend(load_additional_fens(args.fens))
+    # Remove duplicates while preserving order.
+    seen = set()
+    sample_fens = [fen for fen in sample_fens if not (fen in seen or seen.add(fen))]
+
+    export_onnx_model(maia_model, args.output, sample_fens, args.verification_elo, opset=args.opset)
+    verify_against_pytorch(maia_model, args.output, sample_fens, args.verification_elo)
+
+    if args.quantize:
+        maybe_quantize(args.output, args.quantized_output)
+
+    print("All done.")
+
 
 if __name__ == "__main__":
     main()

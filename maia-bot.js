@@ -16,18 +16,35 @@
 (function() {
   'use strict';
 
+  // Guard against multiple injections on SPA navigations
+  if (window.__maiaBrowserBotLoaded) { return; }
+  window.__maiaBrowserBotLoaded = true;
+
   /*************************
    * Configuration
    *************************/
-  const MODEL_URL = 'https://raw.githubusercontent.com/Kazengan/maia-chess-bot/main/maia2_models/rapid_model_quantized.onnx';
+  const MODEL_URL = 'https://raw.githubusercontent.com/Kazengan/maia-chess-bot/main/maia2_models/rapid_model.onnx';
   const MOVE_VOCAB_URL = 'https://raw.githubusercontent.com/Kazengan/maia-chess-bot/main/maia2_models/move_vocab.json';
-  const MODEL_CACHE_KEY = 'maia-chess-model-v1';
+  const ORT_WASM_BASE = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.17.0/dist/';
+  const MODEL_CACHE_KEY = 'maia-chess-model-v2';
+  const LEGACY_MODEL_KEYS = ['maia-chess-model-v1'];
   // Bucketing aligned with maia2.utils.create_elo_dict
   function eloToBucket(elo){
     if (elo < 1100) return 0;
     if (elo >= 2000) return 10;
     // 1100-1199 -> 1, 1200-1299 -> 2, ... 1900-1999 -> 9
     return 1 + Math.floor((elo - 1100) / 100);
+  }
+
+  if (typeof ort !== 'undefined' && ort.env && ort.env.wasm) {
+    const wasmPaths = Object.assign({}, ort.env.wasm.wasmPaths || {});
+    wasmPaths['ort-wasm.wasm'] = `${ORT_WASM_BASE}ort-wasm.wasm`;
+    wasmPaths['ort-wasm-simd.wasm'] = `${ORT_WASM_BASE}ort-wasm-simd.wasm`;
+    wasmPaths['ort-wasm-threaded.wasm'] = `${ORT_WASM_BASE}ort-wasm-threaded.wasm`;
+    wasmPaths['ort-wasm-simd-threaded.wasm'] = `${ORT_WASM_BASE}ort-wasm-simd-threaded.wasm`;
+    ort.env.wasm.wasmPaths = wasmPaths;
+    ort.env.wasm.numThreads = 1; // conservative default for browser sandbox
+    ort.env.wasm.proxy = false;
   }
 
   /*************************
@@ -45,6 +62,18 @@
     set paused(v){ localStorage.setItem('zFenLoggerPaused', v ? '1' : '0'); }
   };
 
+  function migrateEloDefault() {
+    const stored = localStorage.getItem('zMaiaElo');
+    if (!stored) return;
+    const parsed = parseInt(stored, 10);
+    if (Number.isFinite(parsed) && parsed === 1100 && !localStorage.getItem('zMaiaEloMigrated1500')) {
+      localStorage.setItem('zMaiaElo', '1500');
+      localStorage.setItem('zMaiaEloMigrated1500', '1');
+      log('Default ELO migrated from 1100 to 1500');
+    }
+  }
+  migrateEloDefault();
+
   /*************************
    * Global session state (missing before)
    *************************/
@@ -56,7 +85,8 @@
     initialized: false,
     lastHalfmove: 0,
     lastMoveWasPawnOrCapture: false,
-    currentGameId: null
+    currentGameId: null,
+    lastQueriedFen: null
   };
 
   /*************************
@@ -69,6 +99,71 @@
   let moveToIndex = null; // Map UCI -> index
   let vocabLoading = false;
   let vocabError = null;
+
+  // Minimal IndexedDB helper (fallback when idb IIFE is unavailable)
+  function __nativeOpenDB(name, version, upgradeCb){
+    return new Promise((resolve, reject) => {
+      if (!('indexedDB' in window)) { reject(new Error('indexedDB not supported')); return; }
+      const req = indexedDB.open(name, version);
+      req.onupgradeneeded = (ev) => {
+        try { upgradeCb?.(req.result, ev.oldVersion, ev.newVersion, req.transaction); }
+        catch (e) { console.error('[Maia-Chess] IDB upgrade error', e); }
+      };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+  }
+  function __nativeIDBGet(db, store, key){
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(store, 'readonly');
+      const os = tx.objectStore(store);
+      const r = os.get(key);
+      r.onsuccess = () => resolve(r.result ?? null);
+      r.onerror = () => reject(r.error);
+    });
+  }
+  function __nativeIDBPut(db, store, value, key){
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(store, 'readwrite');
+      const os = tx.objectStore(store);
+      const r = os.put(value, key);
+      r.onsuccess = () => resolve();
+      r.onerror = () => reject(r.error);
+    });
+  }
+  function __nativeIDBDelete(db, store, key){
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(store, 'readwrite');
+      const os = tx.objectStore(store);
+      const r = os.delete(key);
+      r.onsuccess = () => resolve();
+      r.onerror = () => reject(r.error);
+    });
+  }
+
+  let CACHE_WRAPPER_PROMISE = null;
+
+  function createCacheWrapper(db, type) {
+    if (type === 'idb') {
+      return {
+        get: (store, key) => db.get(store, key),
+        put: (store, value, key) => db.put(store, value, key),
+        delete: (store, key) => db.delete(store, key)
+      };
+    }
+    if (type === 'native') {
+      return {
+        get: (store, key) => __nativeIDBGet(db, store, key),
+        put: (store, value, key) => __nativeIDBPut(db, store, value, key),
+        delete: (store, key) => __nativeIDBDelete(db, store, key)
+      };
+    }
+    return {
+      get: async () => null,
+      put: async () => {},
+      delete: async () => {}
+    };
+  }
 
   async function loadModel() {
     if (ortSession) return ortSession;
@@ -88,9 +183,10 @@
       // Try to load from IndexedDB cache
       try {
         const cache = await openModelCache();
+        await purgeLegacyModel(cache);
         const cachedModel = await cache.get('models', MODEL_CACHE_KEY);
         if (cachedModel) {
-          ortSession = await ort.InferenceSession.create(cachedModel);
+          ortSession = await ort.InferenceSession.create(cachedModel, { executionProviders: ['wasm'] });
           log('Model loaded from cache');
           return ortSession;
         }
@@ -108,13 +204,14 @@
       // Cache model in IndexedDB
       try {
         const cache = await openModelCache();
+        await purgeLegacyModel(cache);
         await cache.put('models', modelBuffer, MODEL_CACHE_KEY);
         log('Model cached for future use');
       } catch (e) {
         log('Failed to cache model:', e);
       }
 
-      ortSession = await ort.InferenceSession.create(modelBuffer);
+      ortSession = await ort.InferenceSession.create(modelBuffer, { executionProviders: ['wasm'] });
       log('Model loaded successfully');
       return ortSession;
     } catch (e) {
@@ -127,12 +224,48 @@
   }
 
   async function openModelCache() {
-    return await idb.openDB('maia-model-cache', 2, {
-      upgrade(db, oldVersion) {
-        if (!db.objectStoreNames.contains('models')) db.createObjectStore('models');
-        if (!db.objectStoreNames.contains('vocab')) db.createObjectStore('vocab');
+    if (CACHE_WRAPPER_PROMISE) return CACHE_WRAPPER_PROMISE;
+    CACHE_WRAPPER_PROMISE = (async () => {
+      try {
+        if (typeof idb !== 'undefined' && idb.openDB) {
+          const db = await idb.openDB('maia-model-cache', 2, {
+            upgrade(db) {
+              if (!db.objectStoreNames.contains('models')) db.createObjectStore('models');
+              if (!db.objectStoreNames.contains('vocab')) db.createObjectStore('vocab');
+            }
+          });
+          return createCacheWrapper(db, 'idb');
+        }
+      } catch (e) {
+        // continue to native fallback
       }
-    });
+
+      try {
+        const db = await __nativeOpenDB('maia-model-cache', 2, (db) => {
+          if (!db.objectStoreNames.contains('models')) db.createObjectStore('models');
+          if (!db.objectStoreNames.contains('vocab')) db.createObjectStore('vocab');
+        });
+        if (!window.__maiaLoggedIDBNative) { window.__maiaLoggedIDBNative = true; log('Using native IndexedDB for caching.'); }
+        return createCacheWrapper(db, 'native');
+      } catch (e) {
+        if (!window.__maiaLoggedNoIDB) {
+          window.__maiaLoggedNoIDB = true;
+          log('IndexedDB unavailable; caching disabled.');
+        }
+        return createCacheWrapper(null, 'noop');
+      }
+    })();
+    return CACHE_WRAPPER_PROMISE;
+  }
+
+  async function purgeLegacyModel(cache) {
+    if (window.__maiaLegacyCachePurged) return;
+    window.__maiaLegacyCachePurged = true;
+    try {
+      await Promise.all(LEGACY_MODEL_KEYS.map((key) => cache.delete('models', key)));
+    } catch (e) {
+      // ignore failures
+    }
   }
 
   async function loadMoveVocab(){
@@ -279,6 +412,7 @@
       
       const tensor = fenToTensor(fen);
       const eloBucket = eloToBucket(elo);
+      const blackToMove = fen.split(' ')[1] === 'b';
       
       // Prepare inputs for ONNX model; names must match export
       const inputs = {
@@ -303,7 +437,7 @@
       
       for (const move of legalMoves) {
         const uci = move.from + move.to + (move.promotion || '');
-        const moveIndex = getMoveIndex(uci);
+        const moveIndex = getMoveIndex(uci, blackToMove);
         if (moveIndex !== -1 && moveProbs[moveIndex] > highestProb) {
           highestProb = moveProbs[moveIndex];
           bestMove = uci;
@@ -317,10 +451,27 @@
     }
   }
 
+  function mirrorSquare(square) {
+    // mirror ranks: 1<->8, 2<->7, etc. files stay same
+    const file = square[0];
+    const rank = square[1];
+    const mirroredRank = String(9 - parseInt(rank, 10));
+    return `${file}${mirroredRank}`;
+  }
+
+  function mirrorMove(uci) {
+    if (!uci || uci.length < 4) return uci;
+    const from = mirrorSquare(uci.slice(0, 2));
+    const to = mirrorSquare(uci.slice(2, 4));
+    const promo = uci.length > 4 ? uci.slice(4) : '';
+    return `${from}${to}${promo}`;
+  }
+
   // Move index mapping via downloaded vocabulary
-  function getMoveIndex(uci) {
+  function getMoveIndex(uci, mirrorForBlack = false) {
     if (!moveToIndex) return -1;
-    return moveToIndex.has(uci) ? moveToIndex.get(uci) : -1;
+    const key = mirrorForBlack ? mirrorMove(uci) : uci;
+    return moveToIndex.has(key) ? moveToIndex.get(key) : -1;
   }
 
   /*************************
@@ -391,8 +542,8 @@
         <div id="zMaiaRec" class="rec"></div>
         <span class="status" id="zModelStatus">loading...</span>
         <div class="elo-setter">
-          <input type="number" id="zEloInput" class="elo-input" placeholder="ELO">
-          <button id="zEloSetBtn" class="btn">Set</button>
+          <input type="number" id="zEloInput" class="elo-input" placeholder="1500">
+          <button type="button" id="zEloSetBtn" class="btn">Set</button>
         </div>
       </div>
     `;
@@ -415,7 +566,9 @@
       const newElo = parseInt(eloInput.value, 10);
       if (!isNaN(newElo) && newElo > 0) {
         localStorage.setItem('zMaiaElo', newElo);
+        S.lastQueriedFen = null; // force next turn recalculation
         log(`ELO set to ${newElo}`);
+        eloInput.value = String(newElo);
         eloInput.style.borderColor = '#4caf50';
         setTimeout(() => { eloInput.style.borderColor = ''; }, 1500);
       } else {
@@ -441,7 +594,7 @@
       const elo = parseInt(storedElo, 10);
       if (!isNaN(elo) && elo > 0) return elo;
     }
-    return 1100; // Default ELO
+    return 1500; // Default ELO
   }
 
   function displayRecommendation(move) {
@@ -573,8 +726,11 @@
         const userColor = info.botColor;
         if (info.active && info.active === userColor) {
           log("It's your turn! Getting recommendation...");
-          const elo = getMyElo();
-          fetchMaiaMove(fen, elo);
+          if (S.lastQueriedFen !== fen) {
+            S.lastQueriedFen = fen; // debounce per position
+            const elo = getMyElo();
+            fetchMaiaMove(fen, elo);
+          }
         } else {
           clearRecommendation();
         }
