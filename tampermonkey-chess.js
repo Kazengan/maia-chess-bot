@@ -357,6 +357,57 @@
   }
 
   /*************************
+   * Maia integration
+   *************************/
+  function getMyElo() {
+    const ratingEl = $('.user-tagline-rating', $('#board-layout-player-bottom'));
+    if (ratingEl) {
+      const ratingText = ratingEl.textContent.trim().replace(/[()]/g, '');
+      const rating = parseInt(ratingText, 10);
+      if (!isNaN(rating)) return rating;
+    }
+    // Fallback for other layouts if the primary one fails
+    const fallbackEl = $('.user-rating');
+    if (fallbackEl) {
+        const rating = parseInt(fallbackEl.textContent.trim(), 10);
+        if (!isNaN(rating)) return rating;
+    }
+    log("Could not find user ELO, using default 1500.");
+    return 1500; // Default ELO if not found
+  }
+
+  function displayRecommendation(move) {
+    const recEl = $('#zMaiaRec', ui);
+    if (recEl) recEl.textContent = move;
+  }
+
+  function clearRecommendation() {
+    const recEl = $('#zMaiaRec', ui);
+    if (recEl) recEl.textContent = '';
+  }
+
+  async function fetchMaiaMove(fen, elo) {
+    const url = `https://maia.cryptils.com/maia?fen=${encodeURIComponent(fen)}&elo=${elo}`;
+    try {
+      const response = await fetch(url);
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
+      }
+      const data = await response.json();
+      if (data.move) {
+        log('Maia recommends:', data.move);
+        displayRecommendation(data.move);
+      } else {
+        log('Maia API returned an error:', data.error || 'Unknown error');
+        clearRecommendation();
+      }
+    } catch (error) {
+      log('Failed to fetch recommendation from Maia:', error);
+      clearRecommendation();
+    }
+  }
+
+  /*************************
    * session start/stop/reset + SPA watch
    *************************/
   function startSession() {
@@ -369,10 +420,19 @@
       const fen = buildFEN();
       if (change === 'gameover' && info.gameOver) {
         log(`[GAME OVER] winner=${info.winner ?? 'draw'} reason=${info.reason ?? '-'} FEN=${fen}`);
+        clearRecommendation();
         stopSession();
         waitForNextGame();
       } else if (change === 'turn') {
         log(`[TURN] ${info.label} (${info.active}) panel=${info.activeSidePosition} FEN=${fen}`);
+        const userColor = info.botColor;
+        if (info.active && info.active === userColor) {
+          log("It's your turn! Getting recommendation...");
+          const elo = getMyElo();
+          fetchMaiaMove(fen, elo);
+        } else {
+          clearRecommendation();
+        }
       }
     }, { throttleMs: 60 });
     uiSetStatus(true);
@@ -383,6 +443,7 @@
       S.activeListener.disconnect();
       S.activeListener = null;
     }
+    clearRecommendation();
     uiSetStatus(false);
   }
 
@@ -455,6 +516,11 @@
         }
         #zFenWidget .label{ font-size:12px; opacity:.9; user-select:none; }
         #zFenWidget .drag { cursor: move; opacity:.7; margin-right:6px; }
+        #zFenWidget .rec {
+            font-size: 16px; font-weight: bold; color: #ffeb3b;
+            margin-left: 8px; min-width: 60px; text-align: center;
+            font-family: monospace;
+        }
         @media (max-width: 640px) { #zFenWidget { right: 8px; bottom: 8px; } }
       </style>
       <div class="panel">
@@ -464,6 +530,7 @@
         <button class="btn on"    id="zFenBtnOn">ON</button>
         <button class="btn off"   id="zFenBtnOff">OFF</button>
         <button class="btn reset" id="zFenBtnReset">RESET</button>
+        <div id="zMaiaRec" class="rec"></div>
       </div>
     `;
     document.body.appendChild(ui);
