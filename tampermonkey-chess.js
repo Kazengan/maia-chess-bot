@@ -1,11 +1,12 @@
 // ==UserScript==
 // @name         Chess.com FEN Logger + Floating Controls (turn+EP+castling, auto start/stop/reset)
 // @namespace    z-fen-logger
-// @version      1.1.0
-// @description  Auto-detect live games on chess.com, log FEN (turn+EP+castling), reset between games, with floating ON/OFF/RESET widget.
+// @version      1.2.0
+// @description  Auto-detect live games on chess.com, log FEN, get Maia recommendations, with floating widget.
 // @match        https://www.chess.com/game/*
 // @match        https://www.chess.com/play/online/*
 // @match        https://www.chess.com/live/*
+// @connect      maia.cryptils.com
 // @run-at       document-idle
 // @grant        none
 // ==/UserScript==
@@ -360,20 +361,12 @@
    * Maia integration
    *************************/
   function getMyElo() {
-    const ratingEl = $('.user-tagline-rating', $('#board-layout-player-bottom'));
-    if (ratingEl) {
-      const ratingText = ratingEl.textContent.trim().replace(/[()]/g, '');
-      const rating = parseInt(ratingText, 10);
-      if (!isNaN(rating)) return rating;
+    const storedElo = localStorage.getItem('zMaiaElo');
+    if (storedElo) {
+      const elo = parseInt(storedElo, 10);
+      if (!isNaN(elo) && elo > 0) return elo;
     }
-    // Fallback for other layouts if the primary one fails
-    const fallbackEl = $('.user-rating');
-    if (fallbackEl) {
-        const rating = parseInt(fallbackEl.textContent.trim(), 10);
-        if (!isNaN(rating)) return rating;
-    }
-    log("Could not find user ELO, using default 1500.");
-    return 1500; // Default ELO if not found
+    return 1100; // Default ELO
   }
 
   function displayRecommendation(move) {
@@ -493,12 +486,10 @@
           font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial;
         }
         #zFenWidget .panel {
-          background: rgba(20,22,28,0.9);
-          color: #e8f0fe;
+          background: rgba(20,22,28,0.9); color: #e8f0fe;
           border-radius: 10px; padding: 10px; box-shadow: 0 8px 24px rgba(0,0,0,0.35);
-          display: flex; gap: 8px; align-items: center;
-          border: 1px solid rgba(255,255,255,0.08);
-          backdrop-filter: blur(4px);
+          display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+          border: 1px solid rgba(255,255,255,0.08); backdrop-filter: blur(4px);
         }
         #zFenWidget .btn {
           appearance: none; border: 1px solid rgba(255,255,255,0.15);
@@ -510,17 +501,19 @@
         #zFenWidget .on { background:#1b5e20; border-color:#2e7d32; }
         #zFenWidget .off{ background:#5d1721; border-color:#7f2230; }
         #zFenWidget .reset{ background:#263238; }
-        #zFenWidget .dot {
-          width:10px; height:10px; border-radius:50%;
-          background:#f44336; display:inline-block; margin-right:6px; box-shadow:0 0 0 2px rgba(0,0,0,0.2) inset;
-        }
+        #zFenWidget .dot { width:10px; height:10px; border-radius:50%; background:#f44336; display:inline-block; margin-right:6px; box-shadow:0 0 0 2px rgba(0,0,0,0.2) inset; }
         #zFenWidget .label{ font-size:12px; opacity:.9; user-select:none; }
         #zFenWidget .drag { cursor: move; opacity:.7; margin-right:6px; }
-        #zFenWidget .rec {
-            font-size: 16px; font-weight: bold; color: #ffeb3b;
-            margin-left: 8px; min-width: 60px; text-align: center;
-            font-family: monospace;
+        #zFenWidget .rec { font-size: 16px; font-weight: bold; color: #ffeb3b; margin-left: 8px; min-width: 60px; text-align: center; font-family: monospace; }
+        #zFenWidget .elo-setter { display: flex; gap: 4px; margin-left: 8px; align-items: center; }
+        #zFenWidget .elo-input {
+            width: 60px; background: #1e222a; border: 1px solid #3c424f;
+            color: #e8f0fe; border-radius: 6px; padding: 4px 8px;
+            font-size: 12px; text-align: center;
         }
+        #zFenWidget .elo-input::-webkit-outer-spin-button,
+        #zFenWidget .elo-input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+        #zFenWidget .elo-input[type=number] { -moz-appearance: textfield; }
         @media (max-width: 640px) { #zFenWidget { right: 8px; bottom: 8px; } }
       </style>
       <div class="panel">
@@ -531,23 +524,34 @@
         <button class="btn off"   id="zFenBtnOff">OFF</button>
         <button class="btn reset" id="zFenBtnReset">RESET</button>
         <div id="zMaiaRec" class="rec"></div>
+        <div class="elo-setter">
+            <input type="number" id="zEloInput" class="elo-input" placeholder="ELO">
+            <button id="zEloSetBtn" class="btn">Set</button>
+        </div>
       </div>
     `;
     document.body.appendChild(ui);
 
     // actions
-    $('#zFenBtnOn', ui).addEventListener('click', () => {
-      STORE.paused = false;
-      if (!S.activeListener) startSession();
-      else uiSetStatus(true);
-    });
-    $('#zFenBtnOff', ui).addEventListener('click', () => {
-      STORE.paused = true;
-      stopSession();
-    });
-    $('#zFenBtnReset', ui).addEventListener('click', () => {
-      resetStateFromPosition('conservative');
-      log('[RESET] rights=', S.rights, 'ep=', S.epTarget);
+    $('#zFenBtnOn', ui).addEventListener('click', () => { STORE.paused = false; if (!S.activeListener) startSession(); else uiSetStatus(true); });
+    $('#zFenBtnOff', ui).addEventListener('click', () => { STORE.paused = true; stopSession(); });
+    $('#zFenBtnReset', ui).addEventListener('click', () => { resetStateFromPosition('conservative'); log('[RESET] rights=', S.rights, 'ep=', S.epTarget); });
+
+    // ELO setter
+    const eloInput = $('#zEloInput', ui);
+    eloInput.value = getMyElo();
+    $('#zEloSetBtn', ui).addEventListener('click', () => {
+        const newElo = parseInt(eloInput.value, 10);
+        if (!isNaN(newElo) && newElo > 0) {
+            localStorage.setItem('zMaiaElo', newElo);
+            log(`ELO set to ${newElo}`);
+            eloInput.style.borderColor = '#4caf50';
+            setTimeout(() => { eloInput.style.borderColor = ''; }, 1500);
+        } else {
+            log(`Invalid ELO value: ${eloInput.value}`);
+            eloInput.style.borderColor = '#f44336';
+            setTimeout(() => { eloInput.style.borderColor = ''; }, 1500);
+        }
     });
 
     // draggable (simple)
