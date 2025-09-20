@@ -8,7 +8,7 @@
 // @match        https://www.chess.com/live/*
 // @connect      maia.cryptils.com
 // @run-at       document-idle
-// @grant        none
+// @grant        GM_xmlhttpRequest
 // ==/UserScript==
 
 (function () {
@@ -379,25 +379,44 @@
     if (recEl) recEl.textContent = '';
   }
 
-  async function fetchMaiaMove(fen, elo) {
+  function fetchMaiaMove(fen, elo) {
     const url = `https://maia.cryptils.com/maia?fen=${encodeURIComponent(fen)}&elo=${elo}`;
-    try {
-      const response = await fetch(url);
-      if (!response.ok) {
-        throw new Error(`HTTP error! status: ${response.status}`);
-      }
-      const data = await response.json();
-      if (data.move) {
-        log('Maia recommends:', data.move);
-        displayRecommendation(data.move);
-      } else {
-        log('Maia API returned an error:', data.error || 'Unknown error');
-        clearRecommendation();
-      }
-    } catch (error) {
-      log('Failed to fetch recommendation from Maia:', error);
-      clearRecommendation();
-    }
+    log(`Requesting move from: ${url}`);
+
+    GM_xmlhttpRequest({
+        method: "GET",
+        url: url,
+        onload: function(response) {
+            if (response.status >= 200 && response.status < 300) {
+                try {
+                    const data = JSON.parse(response.responseText);
+                    if (data.move) {
+                        log('Maia recommends:', data.move);
+                        displayRecommendation(data.move);
+                    } else {
+                        log('Maia API returned an error:', data.error || 'Unknown error');
+                        clearRecommendation();
+                    }
+                } catch (e) {
+                    log('Failed to parse JSON response from Maia.', e);
+                    log('Raw response:', response.responseText);
+                    clearRecommendation();
+                }
+            } else {
+                log(`Maia server returned non-OK status: ${response.status} ${response.statusText}`);
+                log('Response body:', response.responseText);
+                clearRecommendation();
+            }
+        },
+        onerror: function(error) {
+            log('GM_xmlhttpRequest error. This is likely a network issue, a CORS problem, or the domain is down.', error);
+            clearRecommendation();
+        },
+        ontimeout: function() {
+            log('The request to Maia timed out.');
+            clearRecommendation();
+        }
+    });
   }
 
   /*************************
