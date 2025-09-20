@@ -377,6 +377,7 @@
   function clearRecommendation() {
     const recEl = $('#zMaiaRec', ui);
     if (recEl) recEl.textContent = '';
+    clearArrow();
   }
 
   function fetchMaiaMove(fen, elo) {
@@ -393,6 +394,11 @@
                     if (data.move) {
                         log('Maia recommends:', data.move);
                         displayRecommendation(data.move);
+                        if (data.move.length >= 4) {
+                            const from = data.move.substring(0, 2);
+                            const to = data.move.substring(2, 4);
+                            drawArrow(from, to);
+                        }
                     } else {
                         log('Maia API returned an error:', data.error || 'Unknown error');
                         clearRecommendation();
@@ -420,6 +426,79 @@
   }
 
   /*************************
+   * Board Visualization
+   *************************/
+  let visOverlay = null;
+
+  function createBoardOverlay() {
+      if (visOverlay && document.body.contains(visOverlay)) return;
+      const boardEl = $('#board-single');
+      if (!boardEl) { return; }
+
+      visOverlay = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+      visOverlay.style.position = 'absolute';
+      visOverlay.style.top = '0';
+      visOverlay.style.left = '0';
+      visOverlay.style.width = '100%';
+      visOverlay.style.height = '100%';
+      visOverlay.style.pointerEvents = 'none';
+      visOverlay.style.zIndex = '10';
+      visOverlay.id = 'maia-vis-overlay';
+
+      visOverlay.innerHTML = `
+          <defs>
+              <marker id="maia-arrowhead" markerWidth="4" markerHeight="3" refX="4" refY="1.5" orient="auto">
+                  <polygon points="0 0, 4 1.5, 0 3" fill="#fef200" />
+              </marker>
+          </defs>
+      `;
+      boardEl.appendChild(visOverlay);
+  }
+
+  function getSquareCoords(square) { // e.g., "e4"
+      const boardEl = $('#board-single');
+      if (!boardEl) return null;
+
+      const { width } = boardEl.getBoundingClientRect();
+      const sqSize = width / 8;
+      const { f, r } = nameToIdx(square);
+      const info = detectChessTurn();
+      const isFlipped = info.botColor === 'b';
+
+      const x = (isFlipped ? (7 - f) : f) * sqSize;
+      const y = (isFlipped ? r : (7 - r)) * sqSize;
+
+      return { x: x + sqSize / 2, y: y + sqSize / 2 };
+  }
+
+  function drawArrow(from, to) {
+      if (!visOverlay || !document.body.contains(visOverlay)) createBoardOverlay();
+      if (!visOverlay) return;
+
+      clearArrow();
+      const fromCoords = getSquareCoords(from);
+      const toCoords = getSquareCoords(to);
+      if (!fromCoords || !toCoords) return;
+
+      const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+      line.setAttribute('x1', fromCoords.x);
+      line.setAttribute('y1', fromCoords.y);
+      line.setAttribute('x2', toCoords.x);
+      line.setAttribute('y2', toCoords.y);
+      line.setAttribute('stroke', '#fef200');
+      line.setAttribute('stroke-width', '10');
+      line.setAttribute('stroke-opacity', '0.8');
+      line.setAttribute('marker-end', 'url(#maia-arrowhead)');
+      line.id = 'maia-rec-arrow';
+      visOverlay.appendChild(line);
+  }
+
+  function clearArrow() {
+      const existingArrow = $('#maia-rec-arrow', visOverlay);
+      if (existingArrow) existingArrow.remove();
+  }
+
+  /*************************
    * session start/stop/reset + SPA watch
    *************************/
   function startSession() {
@@ -427,6 +506,7 @@
     if (STORE.paused) { log('Paused (OFF). Not starting.'); return; }
     resetStateFromPosition('conservative');
     log('Game detected → start listener');
+    setTimeout(createBoardOverlay, 500);
 
     S.activeListener = onTurnChange((info, change) => {
       const fen = buildFEN();
