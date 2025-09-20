@@ -2,6 +2,7 @@
 venv/
 
 # maia2_models/
-maia2/
-
-maia2_models/rapid_model.pt
+# maia2/
+# maia2_models/rapid_model_quantized.onnx
+# maia2_models/rapid_model.onnx
+# maia2_models/rapid_model.pt

@@ -6,7 +6,7 @@
 // @match        https://www.chess.com/game/*
 // @match        https://www.chess.com/play/online/*
 // @match        https://www.chess.com/live/*
-// @connect      maia.cryptils.com
+// @connect      localhost
 // @run-at       document-idle
 // @grant        GM_xmlhttpRequest
 // ==/UserScript==
@@ -381,7 +381,7 @@
   }
 
   function fetchMaiaMove(fen, elo) {
-    const url = `https://maia.cryptils.com/maia?fen=${encodeURIComponent(fen)}&elo=${elo}`;
+    const url = `http://localhost:55555/maia?fen=${encodeURIComponent(fen)}&elo=${elo}`;
     log(`Requesting move from: ${url}`);
 
     GM_xmlhttpRequest({
