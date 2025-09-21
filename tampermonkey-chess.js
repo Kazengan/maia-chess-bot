@@ -54,9 +54,9 @@
     epTarget: '-',
     prevBoard: null,
     initialized: false,
-    lastHalfmove: 0,
-    lastMoveWasPawnOrCapture: false,
-    currentGameId: null
+    halfmoveClock: 0,
+    currentGameId: null,
+    lastRecommendationKey: null
   };
 
   /*************************
@@ -238,9 +238,7 @@
     const nums = [...txt.matchAll(/(\d+)\./g)];
     if (nums.length) lastNum = parseInt(nums[nums.length - 1][1], 10);
     const fullmove = (active === 'w') ? (lastNum + 1) : lastNum;
-    const halfmove = S.lastMoveWasPawnOrCapture ? 0 : (S.lastHalfmove + 1);
-    S.lastHalfmove = halfmove;
-    S.lastMoveWasPawnOrCapture = false;
+    const halfmove = Number.isFinite(S.halfmoveClock) ? S.halfmoveClock : 0;
     return { halfmove, fullmove };
   }
 
@@ -256,8 +254,8 @@
     S.epTarget = '-';
     S.prevBoard = board;
     S.initialized = true;
-    S.lastHalfmove = 0;
-    S.lastMoveWasPawnOrCapture = false;
+    S.halfmoveClock = 0;
+    S.lastRecommendationKey = null;
   }
 
   function buildFEN() {
@@ -279,31 +277,36 @@
     return `${placement} ${active} ${castling} ${S.epTarget || '-'} ${halfmove} ${fullmove}`;
   }
 
+  const positionKeyFromFEN = (fen) => fen.split(' ').slice(0, 4).join(' ');
+
   function updateStateOnTurnChange() {
     const info = detectChessTurn();
     const boardNow = parsePieces();
     const mover = info.active === 'w' ? 'b' : 'w';
 
+    const before = S.prevBoard || {};
+    const gone = Object.keys(before).filter(sq => before[sq] && !boardNow[sq]);
+    const appeared = Object.keys(boardNow).filter(sq => !before[sq] || before[sq] !== boardNow[sq]);
+
     let { from, to } = getHighlightedFromTo();
-    if (!from || !to) {
-      const before = S.prevBoard || {};
-      const gone = Object.keys(before).filter(sq => before[sq] && !boardNow[sq]);
-      const appeared = Object.keys(boardNow).filter(sq => !before[sq] || before[sq] !== boardNow[sq]);
-      if (gone.length === 1) from = gone[0];
-      if (appeared.length === 1) to = appeared[0];
-    }
+    if (!from && gone.length === 1) from = gone[0];
+    if (!to && appeared.length === 1) to = appeared[0];
 
-    updateRightsOnMove(S.prevBoard || {}, boardNow, mover, from, to);
-    S.epTarget = computeEnPassant(S.prevBoard || {}, boardNow, mover, from, to);
+    updateRightsOnMove(before, boardNow, mover, from, to);
+    S.epTarget = computeEnPassant(before, boardNow, mover, from, to);
 
-    let wasPawnOrCapture = false;
-    if (from && to) {
-      const pieceTo = boardNow[to];
-      const captureOccurred = !!(S.prevBoard && S.prevBoard[to] && (S.prevBoard[to][0] !== mover));
-      const isPawnMove = pieceTo?.[1] === 'P';
-      wasPawnOrCapture = isPawnMove || captureOccurred;
+    const boardChanged = gone.length > 0 || appeared.length > 0;
+    if (boardChanged) {
+      const captureOccurred =
+        appeared.some(sq => before[sq] && before[sq][0] !== mover) ||
+        gone.some(sq => before[sq] && before[sq][0] !== mover);
+      const pawnMoved =
+        gone.some(sq => before[sq]?.[0] === mover && before[sq]?.[1] === 'P') ||
+        appeared.some(sq => boardNow[sq]?.[0] === mover && boardNow[sq]?.[1] === 'P');
+      const wasPawnOrCapture = captureOccurred || pawnMoved;
+      if (wasPawnOrCapture) S.halfmoveClock = 0;
+      else S.halfmoveClock = (Number.isFinite(S.halfmoveClock) ? S.halfmoveClock : 0) + 1;
     }
-    S.lastMoveWasPawnOrCapture = wasPawnOrCapture;
     S.prevBoard = boardNow;
   }
 
@@ -378,6 +381,7 @@
     const recEl = $('#zMaiaRec', ui);
     if (recEl) recEl.textContent = '';
     clearArrow();
+    S.lastRecommendationKey = null;
   }
 
   function fetchMaiaMove(fen, elo) {
@@ -510,6 +514,7 @@
 
     S.activeListener = onTurnChange((info, change) => {
       const fen = buildFEN();
+      const positionKey = positionKeyFromFEN(fen);
       if (change === 'gameover' && info.gameOver) {
         log(`[GAME OVER] winner=${info.winner ?? 'draw'} reason=${info.reason ?? '-'} FEN=${fen}`);
         clearRecommendation();
@@ -519,9 +524,14 @@
         log(`[TURN] ${info.label} (${info.active}) panel=${info.activeSidePosition} FEN=${fen}`);
         const userColor = info.botColor;
         if (info.active && info.active === userColor) {
-          log("It's your turn! Getting recommendation...");
-          const elo = getMyElo();
-          fetchMaiaMove(fen, elo);
+          if (S.lastRecommendationKey === positionKey) {
+            log('Already requested recommendation for this position. Skipping duplicate call.');
+          } else {
+            S.lastRecommendationKey = positionKey;
+            log("It's your turn! Getting recommendation...");
+            const elo = getMyElo();
+            fetchMaiaMove(fen, elo);
+          }
         } else {
           clearRecommendation();
         }
